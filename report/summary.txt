@@ -1,0 +1,20 @@
+Краткий отчёт по анализу сетевого дампа (PCAP)
+
+Источник данных: dhcp.pcapng
+Метод: tshark -> pandas -> базовая аналитика + визуализация
+
+Артефакты:
+- IP endpoints (ip.src/ip.dst): 4 пакетов
+  Уникальных IP (src+dst): 4
+- DHCP/BOOTP events: 4 пакетов
+  DHCP types: {'Unknown': 4}
+  DHCP Option 6 (DNS servers) найдено: [nan]
+  DHCP server IP (server_ip): [nan, '192.168.0.1']
+- DNS queries (dns.qry.name): 0
+  DNS queries не обнаружены в дампе (это тоже результат анализа).
+  Возможные причины: трафик DNS отсутствует/обрезан/использовались DoH/DoT.
+
+Рекомендации:
+- Если нужна именно DNS активность: проверить наличие DoH/DoT (HTTPS/TLS), SNI, QUIC.
+- Проверить выданные IP (assigned_ip), MAC и hostname из DHCP на соответствие ожидаемым хостам.
+- При необходимости — запросить более полный PCAP (не только DHCP).
