@@ -54,7 +54,7 @@ def _safe(pkt: Any, expr: str) -> Optional[str]:
 def normalize_epoch(pkt: Any) -> Optional[float]:
     try:
         # sniff_timestamp = str epoch
-        return float(pkt.sniff_timestamp)
+        return float(getattr(pkt, "sniff_timestamp", None) or getattr(pkt, "sniff_time").timestamp())
     except Exception:
         return None
 
@@ -146,6 +146,9 @@ def main() -> None:
 
     # Нормализуем время
     df["time"] = pd.to_datetime(df["time_epoch"], unit="s", errors="coerce")
+    print("DEBUG: rows total =", len(df))
+    print("DEBUG: time_epoch non-null =", df["time_epoch"].notna().sum())
+    print("DEBUG: time non-null =", df["time"].notna().sum())
 
     # Сохраняем «лог артефактов»
     df.sort_values("time", inplace=True)
@@ -180,25 +183,32 @@ def main() -> None:
     plt.savefig(OUTPUTS_DIR / "dhcp_message_types.png", dpi=200)
     plt.close()
 
-    # -----------------------------
-    # Визуализация 2: активность во времени (по минутам)
-    # -----------------------------
-    df_time = df.dropna(subset=["time"]).copy()
-    if not df_time.empty:
-        df_time["minute"] = df_time["time"].dt.floor("min")
-        series = df_time.groupby("minute").size()
+# Визуализация 2: активность во времени
+# -----------------------------
+df_time = df.copy()
 
-        plt.figure()
-        series.plot()
-        plt.title("DHCP messages over time (per minute)")
-        plt.xlabel("Time (minute)")
-        plt.ylabel("Messages")
-        plt.tight_layout()
-        plt.savefig(OUTPUTS_DIR / "dhcp_message_over_time.png", dpi=200)
-        plt.close()
+plt.figure()
 
-    print("OK: artifacts saved to:", ARTIFACTS_DIR)
-    print("OK: plots saved to:", OUTPUTS_DIR)
+if df_time["time"].notna().any():
+    # нормальный вариант: по минутам
+    df_time = df_time.dropna(subset=["time"]).copy()
+    df_time["minute"] = df_time["time"].dt.floor("min")
+    series = df_time.groupby("minute").size()
+    series.plot()
+    plt.title("DHCP messages over time (per minute)")
+    plt.xlabel("Time (minute)")
+    plt.ylabel("Messages")
+else:
+    # fallback: если время не распарсилось — строим по порядку пакетов
+    series = pd.Series(range(1, len(df_time) + 1), index=range(len(df_time)))
+    series.plot()
+    plt.title("DHCP messages over capture order")
+    plt.xlabel("Packet index")
+    plt.ylabel("Cumulative messages")
+
+plt.tight_layout()
+plt.savefig(OUTPUTS_DIR / "dhcp_message_over_time.png", dpi=200)
+plt.close()
 
 
 if __name__ == "__main__":
