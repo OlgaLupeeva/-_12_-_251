@@ -16,5 +16,5 @@
 
 ## Как запустить
 ```bash
-pip install -r requirements.txt
+py -m pip install -r requirements.txt
 python src/analyze_dhcp.py
