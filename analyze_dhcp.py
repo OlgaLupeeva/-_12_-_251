@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import csv
+import subprocess
 from pathlib import Path
-from typing import Any, Optional, Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import matplotlib.pyplot as plt
 
-
 # -----------------------------
-# Настройки путей
+# Пути проекта
 # -----------------------------
 BASE_DIR = Path(__file__).resolve().parents[1]
 PCAP_PATH = BASE_DIR / "data" / "dhcp.pcapng"
@@ -20,153 +21,196 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # -----------------------------
-# Утилиты для безопасного извлечения полей pyshark
+# Маппинг DHCP Message Type (Option 53)
 # -----------------------------
-def _safe_get(pkt: Any, layer_name: str, field: str) -> Optional[str]:
-    """Пробует достать поле из указанного слоя. Возвращает строку или None."""
-    try:
-        layer = getattr(pkt, layer_name)
-        if hasattr(layer, field):
-            return str(getattr(layer, field))
-        if hasattr(layer, "get_field_value"):
-            v = layer.get_field_value(field)
-            return str(v) if v is not None else None
-        return None
-    except Exception:
-        return None
+DHCP_TYPE_MAP = {
+    "1": "Discover",
+    "2": "Offer",
+    "3": "Request",
+    "4": "Decline",
+    "5": "ACK",
+    "6": "NAK",
+    "7": "Release",
+    "8": "Inform",
+}
 
 
-def _safe(pkt: Any, expr: str) -> Optional[str]:
-    """expr вида: 'ip.src' или 'bootp.yiaddr'"""
-    try:
-        layer_name, field = expr.split(".", 1)
-        return _safe_get(pkt, layer_name, field)
-    except Exception:
-        return None
+# -----------------------------
+# Вспомогательные функции
+# -----------------------------
+def run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
+    """Запускает команду и возвращает (код, stdout, stderr)."""
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return p.returncode, p.stdout, p.stderr
 
 
-def normalize_epoch(pkt: Any) -> Optional[float]:
-    """Достаём время пакета в epoch (секунды)."""
-    # Основной вариант
-    try:
-        v = getattr(pkt, "sniff_timestamp", None)
-        if v is not None:
-            return float(v)
-    except Exception:
-        pass
+def get_tshark_fields_set() -> set:
+    """
+    Получаем список всех полей tshark (tshark -G fields),
+    чтобы потом выбирать правильные имена полей под твою версию Wireshark.
+    """
+    code, out, err = run_cmd(["tshark", "-G", "fields"])
+    if code != 0:
+        raise RuntimeError(
+            "Не удалось выполнить 'tshark -G fields'.\n"
+            f"stderr:\n{err}\n"
+            "Проверь, что Wireshark установлен и tshark доступен в PATH."
+        )
 
-    # Фолбэк: sniff_time -> datetime
-    try:
-        st = getattr(pkt, "sniff_time", None)
-        if st is not None:
-            return float(st.timestamp())
-    except Exception:
-        pass
+    fields = set()
+    # Формат строк примерно: F <field_name>\t<...>
+    for line in out.splitlines():
+        if line.startswith("F\t"):
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                fields.add(parts[1].strip())
+    return fields
 
+
+def pick_first_existing(fields_set: set, candidates: List[str]) -> Optional[str]:
+    """Возвращает первое поле из candidates, которое реально существует в tshark."""
+    for f in candidates:
+        if f in fields_set:
+            return f
     return None
 
 
+def human_msg_type(v: Optional[str]) -> str:
+    if v is None or v == "":
+        return "Unknown"
+    v = v.strip()
+    # Иногда tshark может вернуть "1" или "0x01" или "Discover" — сделаем аккуратно.
+    if v.lower().startswith("0x"):
+        try:
+            v = str(int(v, 16))
+        except Exception:
+            return v
+    return DHCP_TYPE_MAP.get(v, v)
+
+
 # -----------------------------
-# Основной парсинг
+# Основная логика
 # -----------------------------
 def main() -> None:
-    # Импорт здесь, чтобы файл открывался даже без pyshark
-    import pyshark  # type: ignore
-    import asyncio
-
     if not PCAP_PATH.exists():
         raise FileNotFoundError(f"Не найден файл дампа: {PCAP_PATH}")
 
-    # Фикс для Python 3.14 / asyncio: создаём event loop явно
-    asyncio.set_event_loop(asyncio.new_event_loop())
+    # 1) Узнаём, какие поля есть в твоём tshark
+    fields_set = get_tshark_fields_set()
 
-    # Важно: display_filter = "bootp" обычно покрывает DHCP
-    cap = pyshark.FileCapture(
-        str(PCAP_PATH),
-        display_filter="bootp",
-        keep_packets=False,
-        use_json=True,
-        include_raw=False,
+    # 2) Выбираем реальные поля под твою версию Wireshark
+    # Время (epoch)
+    f_time = pick_first_existing(fields_set, ["frame.time_epoch"])
+    if not f_time:
+        raise RuntimeError("В твоём tshark не найдено поле frame.time_epoch (очень странно).")
+
+    # DHCP message type (Option 53 value)
+    # На разных версиях встречаются разные имена — поэтому список кандидатов.
+    f_msg_type = pick_first_existing(
+        fields_set,
+        [
+            "dhcp.option.dhcp",                     # часто работает
+            "bootp.option.dhcp",                    # иногда DHCP остаётся в bootp
+            "dhcp.option.dhcp_message_type",        # у некоторых версий
+            "dhcp.option.message_type",             # редкий вариант
+        ],
     )
 
-    events: List[Dict[str, Any]] = []
+    # IP источника/назначения
+    f_ip_src = pick_first_existing(fields_set, ["ip.src"])
+    f_ip_dst = pick_first_existing(fields_set, ["ip.dst"])
 
-    # DHCP message type mapping
-    dhcp_type_map = {
-        "1": "Discover",
-        "2": "Offer",
-        "3": "Request",
-        "4": "Decline",
-        "5": "ACK",
-        "6": "NAK",
-        "7": "Release",
-        "8": "Inform",
-    }
+    # BOOTP/DHCP поля
+    f_xid = pick_first_existing(fields_set, ["bootp.xid"])
+    f_hw = pick_first_existing(fields_set, ["bootp.hw_mac_addr", "bootp.chaddr"])
+    f_yiaddr = pick_first_existing(fields_set, ["bootp.yiaddr"])
+    f_siaddr = pick_first_existing(fields_set, ["bootp.siaddr"])
 
-    for pkt in cap:
-        t_epoch = normalize_epoch(pkt)
+    # DHCP options
+    f_hostname = pick_first_existing(fields_set, ["dhcp.option.hostname", "dhcp.option_host_name", "dhcp.option.host_name"])
+    f_req_ip = pick_first_existing(fields_set, ["dhcp.option.requested_ip_address"])
+    f_server_id = pick_first_existing(fields_set, ["dhcp.option.dhcp_server_id", "dhcp.option.server_id"])
+    f_router = pick_first_existing(fields_set, ["dhcp.option.router"])
+    f_dns = pick_first_existing(fields_set, ["dhcp.option.domain_name_server"])
 
-        ip_src = _safe(pkt, "ip.src")
-        ip_dst = _safe(pkt, "ip.dst")
+    # 3) Собираем список полей, которые будем вытаскивать
+    # Важно: tshark выдаёт значения в том порядке, в котором идут -e
+    fields_order: List[Tuple[str, Optional[str]]] = [
+        ("time_epoch", f_time),
+        ("ip_src", f_ip_src),
+        ("ip_dst", f_ip_dst),
+        ("xid", f_xid),
+        ("client_mac", f_hw),
+        ("yiaddr_assigned", f_yiaddr),
+        ("server_ip", f_siaddr),
+        ("msg_type_raw", f_msg_type),
+        ("hostname", f_hostname),
+        ("requested_ip", f_req_ip),
+        ("server_id", f_server_id),
+        ("router", f_router),
+        ("dns", f_dns),
+    ]
 
-        xid = _safe(pkt, "bootp.xid")
-        client_mac = _safe(pkt, "bootp.hw_mac_addr") or _safe(pkt, "bootp.chaddr")
+    # Оставим только реально существующие поля (None убираем)
+    tshark_fields = [(name, f) for name, f in fields_order if f is not None]
 
-        yiaddr = _safe(pkt, "bootp.yiaddr")
-        siaddr = _safe(pkt, "bootp.siaddr")
+    # 4) Запускаем tshark и вытаскиваем таблицу
+    cmd = ["tshark", "-r", str(PCAP_PATH), "-Y", "bootp", "-T", "fields"]
+    # Чтобы поля нормально разделялись:
+    cmd += ["-E", "separator=\t", "-E", "occurrence=f", "-E", "quote=n"]
+    for _, f in tshark_fields:
+        cmd += ["-e", f]  # type: ignore[arg-type]
 
-        # msg type
-        dhcp_msg_type = _safe(pkt, "dhcp.option_dhcp") or _safe(pkt, "bootp.option_dhcp")
-        dhcp_msg_type_human = dhcp_type_map.get(str(dhcp_msg_type), str(dhcp_msg_type) if dhcp_msg_type is not None else None)
-
-        hostname = _safe(pkt, "dhcp.option_hostname")
-        requested_ip = _safe(pkt, "dhcp.option_requested_ip_address")
-        server_id = _safe(pkt, "dhcp.option_dhcp_server_id")
-        router = _safe(pkt, "dhcp.option_router")
-        dns = _safe(pkt, "dhcp.option_domain_name_server")
-
-        events.append(
-            {
-                "time_epoch": t_epoch,
-                "ip_src": ip_src,
-                "ip_dst": ip_dst,
-                "xid": xid,
-                "client_mac": client_mac,
-                "msg_type": dhcp_msg_type_human,
-                "yiaddr_assigned": yiaddr,
-                "server_ip": siaddr or server_id,
-                "requested_ip": requested_ip,
-                "hostname": hostname,
-                "router": router,
-                "dns": dns,
-            }
+    code, out, err = run_cmd(cmd)
+    if code != 0:
+        raise RuntimeError(
+            "tshark не смог прочитать дамп или поля.\n"
+            f"Команда:\n{' '.join(cmd)}\n\n"
+            f"stderr:\n{err}"
         )
 
-    df = pd.DataFrame(events)
+    # 5) Парсим вывод в список словарей
+    rows: List[Dict[str, str]] = []
+    lines = [ln for ln in out.splitlines() if ln.strip() != ""]
+    for ln in lines:
+        parts = ln.split("\t")
+        row: Dict[str, str] = {}
+        for i, (col_name, _) in enumerate(tshark_fields):
+            row[col_name] = parts[i] if i < len(parts) else ""
+        rows.append(row)
 
-    # Нормализуем время
-    df["time"] = pd.to_datetime(df["time_epoch"], unit="s", errors="coerce")
+    # 6) DataFrame + нормализация
+    df = pd.DataFrame(rows)
 
-    # DEBUG (можешь потом убрать)
-    print("DEBUG: rows total =", len(df))
+    # time_epoch -> float
     if "time_epoch" in df.columns:
-        print("DEBUG: time_epoch non-null =", int(df["time_epoch"].notna().sum()))
-    if "time" in df.columns:
-        print("DEBUG: time non-null =", int(df["time"].notna().sum()))
+        df["time_epoch"] = pd.to_numeric(df["time_epoch"], errors="coerce")
 
-    # Сохраняем «лог артефактов»
-    if not df.empty and "time" in df.columns:
-        df.sort_values("time", inplace=True)
+    # msg_type -> человекочитаемо
+    if "msg_type_raw" in df.columns:
+        df["msg_type"] = df["msg_type_raw"].apply(lambda x: human_msg_type(x if pd.notna(x) else None))
+    else:
+        df["msg_type"] = "Unknown"
+
+    # server_ip: если siaddr пустой, подставим server_id
+    if "server_ip" in df.columns and "server_id" in df.columns:
+        df["server_ip"] = df["server_ip"].where(df["server_ip"].astype(str).str.len() > 0, df["server_id"])
+
+    # time (datetime)
+    df["time"] = pd.to_datetime(df.get("time_epoch"), unit="s", errors="coerce")
+
+    # DEBUG (чтобы видеть, что время и типы реально появились)
+    print("DEBUG: rows total =", len(df))
+    print("DEBUG: time_epoch non-null =", int(df["time_epoch"].notna().sum()) if "time_epoch" in df.columns else 0)
+    print("DEBUG: time non-null =", int(df["time"].notna().sum()))
+    print("DEBUG: msg_type unique =", df["msg_type"].value_counts(dropna=False).to_dict())
+
+    # 7) Сохраняем events
+    df.sort_values("time", inplace=True, na_position="last")
     df.to_csv(ARTIFACTS_DIR / "dhcp_events.csv", index=False)
 
-    # -----------------------------
-    # Leases (ACK/OFFER)
-    # -----------------------------
-    if not df.empty and "msg_type" in df.columns:
-        leases = df[df["msg_type"].isin(["ACK", "Offer"])].copy()
-    else:
-        leases = df.copy()
-
+    # 8) leases (по ACK/OFFER)
+    leases = df[df["msg_type"].isin(["ACK", "Offer"])].copy()
     if not leases.empty:
         leases_summary = (
             leases.dropna(subset=["client_mac", "yiaddr_assigned"])
@@ -181,17 +225,9 @@ def main() -> None:
 
     leases_summary.to_csv(ARTIFACTS_DIR / "dhcp_leases.csv", index=False)
 
-    # -----------------------------
-    # Визуализация 1: количество DHCP-сообщений по типам
-    # -----------------------------
-    if not df.empty and "msg_type" in df.columns:
-        type_counts = df["msg_type"].fillna("Unknown").value_counts()
-    else:
-        type_counts = pd.Series(dtype=int)
-
+    # 9) Plot 1: типы сообщений
     plt.figure()
-    if not type_counts.empty:
-        type_counts.plot(kind="bar")
+    df["msg_type"].fillna("Unknown").value_counts().plot(kind="bar")
     plt.title("DHCP message types (counts)")
     plt.xlabel("Message type")
     plt.ylabel("Count")
@@ -199,15 +235,10 @@ def main() -> None:
     plt.savefig(OUTPUTS_DIR / "dhcp_message_types.png", dpi=200)
     plt.close()
 
-    # -----------------------------
-    # Визуализация 2: активность во времени
-    #   - если время есть → по минутам
-    #   - если времени нет → по порядку пакетов (fallback)
-    # -----------------------------
+    # 10) Plot 2: активность во времени (по минутам)
     plt.figure()
-
-    if not df.empty and df["time"].notna().any():
-        df_time = df.dropna(subset=["time"]).copy()
+    df_time = df.dropna(subset=["time"]).copy()
+    if not df_time.empty:
         df_time["minute"] = df_time["time"].dt.floor("min")
         series = df_time.groupby("minute").size()
         series.plot()
@@ -215,7 +246,8 @@ def main() -> None:
         plt.xlabel("Time (minute)")
         plt.ylabel("Messages")
     else:
-        series = pd.Series(range(1, len(df) + 1), index=range(len(df)))
+        # На случай, если внезапно времени не будет (маловероятно с tshark)
+        series = pd.Series(range(1, len(df) + 1))
         series.plot()
         plt.title("DHCP messages over capture order")
         plt.xlabel("Packet index")
