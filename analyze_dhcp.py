@@ -194,7 +194,7 @@ def main() -> None:
         plt.xlabel("Time (minute)")
         plt.ylabel("Messages")
         plt.tight_layout()
-        plt.savefig(OUTPUTS_DIR / "dhcp_messages_over_time.png", dpi=200)
+        plt.savefig(OUTPUTS_DIR / "dhcp_message_over_time.png", dpi=200)
         plt.close()
 
     print("OK: artifacts saved to:", ARTIFACTS_DIR)
