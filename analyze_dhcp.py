@@ -70,6 +70,9 @@ def main() -> None:
         raise FileNotFoundError(f"Не найден файл дампа: {PCAP_PATH}")
 
     # Важно: display_filter = "bootp" обычно покрывает DHCP
+    import asyncio
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    
     cap = pyshark.FileCapture(
         str(PCAP_PATH),
         display_filter="bootp",
