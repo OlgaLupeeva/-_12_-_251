@@ -1,395 +1,230 @@
-import pyshark
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Optional, Dict, List
+
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
-from datetime import datetime
-from collections import defaultdict
-import os
-import sys
 
-# Добавляем обработку asyncio для Windows
-if sys.platform == 'win32':
+
+# -----------------------------
+# Настройки путей
+# -----------------------------
+BASE_DIR = Path(__file__).resolve().parents[1]
+PCAP_PATH = BASE_DIR / "data" / "dhcp.pcapng"
+ARTIFACTS_DIR = BASE_DIR / "artifacts"
+OUTPUTS_DIR = BASE_DIR / "outputs"
+
+ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# -----------------------------
+# Утилиты для безопасного извлечения полей pyshark
+# -----------------------------
+def _safe_get(pkt: Any, layer_name: str, field: str) -> Optional[str]:
+    """Пробует достать поле из указанного слоя. Возвращает строку или None."""
+    try:
+        layer = getattr(pkt, layer_name)
+        if hasattr(layer, field):
+            return str(getattr(layer, field))
+        if hasattr(layer, "get_field_value"):
+            v = layer.get_field_value(field)
+            return str(v) if v is not None else None
+        return None
+    except Exception:
+        return None
+
+
+def _safe(pkt: Any, expr: str) -> Optional[str]:
+    """expr вида: 'ip.src' или 'bootp.yiaddr'"""
+    try:
+        layer_name, field = expr.split(".", 1)
+        return _safe_get(pkt, layer_name, field)
+    except Exception:
+        return None
+
+
+def normalize_epoch(pkt: Any) -> Optional[float]:
+    """Достаём время пакета в epoch (секунды)."""
+    # Основной вариант
+    try:
+        v = getattr(pkt, "sniff_timestamp", None)
+        if v is not None:
+            return float(v)
+    except Exception:
+        pass
+
+    # Фолбэк: sniff_time -> datetime
+    try:
+        st = getattr(pkt, "sniff_time", None)
+        if st is not None:
+            return float(st.timestamp())
+    except Exception:
+        pass
+
+    return None
+
+
+# -----------------------------
+# Основной парсинг
+# -----------------------------
+def main() -> None:
+    # Импорт здесь, чтобы файл открывался даже без pyshark
+    import pyshark  # type: ignore
     import asyncio
-    asyncio.set_event_loop(asyncio.ProactorEventLoop())
 
-class DHCPAnalyzer:
-    def __init__(self, pcap_file):
-        self.pcap_file = pcap_file
-        self.dhcp_events = []
-        self.dhcp_leases = []
-        
-    def load_and_analyze(self):
-        """Загрузка и анализ pcap файла"""
-        print(f"[+] Загрузка файла: {self.pcap_file}")
-        
-        if not os.path.exists(self.pcap_file):
-            print(f"[-] Ошибка: файл {self.pcap_file} не найден!")
-            return False
-        
-        try:
-            # Используем простой фильтр для DHCP
-            cap = pyshark.FileCapture(
-                self.pcap_file,
-                display_filter='dhcp',
-                use_json=False,
-                keep_packets=False
-            )
-            
-            print(f"[+] Анализ пакетов...")
-            packet_num = 0
-            
-            for packet in cap:
-                packet_num += 1
-                
-                # Проверяем наличие DHCP слоя
-                if hasattr(packet, 'dhcp'):
-                    self.process_dhcp_packet(packet, packet_num)
-                elif hasattr(packet, 'bootp'):
-                    self.process_bootp_packet(packet, packet_num)
-                elif 'DHCP' in str(packet):
-                    # Пробуем извлечь информацию даже если нет явного слоя
-                    self.process_generic_packet(packet, packet_num)
-            
-            cap.close()
-            
-            print(f"[+] Всего обработано пакетов: {packet_num}")
-            print(f"[+] Найдено DHCP событий: {len(self.dhcp_events)}")
-            
-            return True
-            
-        except Exception as e:
-            print(f"[-] Ошибка при загрузке: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-    
-    def process_dhcp_packet(self, packet, num):
-        """Обработка DHCP пакета"""
-        try:
-            dhcp = packet.dhcp
-            
-            # Получаем тип DHCP сообщения
-            msg_type = "UNKNOWN"
-            if hasattr(dhcp, 'dhcp_message_type'):
-                type_map = {
-                    '1': 'DISCOVER',
-                    '2': 'OFFER', 
-                    '3': 'REQUEST',
-                    '4': 'DECLINE',
-                    '5': 'ACK',
-                    '6': 'NAK',
-                    '7': 'RELEASE',
-                    '8': 'INFORM'
-                }
-                msg_type = type_map.get(str(dhcp.dhcp_message_type), 'UNKNOWN')
-            
-            # Извлекаем IP адреса
-            src_ip = packet.ip.src if hasattr(packet, 'ip') else '0.0.0.0'
-            dst_ip = packet.ip.dst if hasattr(packet, 'ip') else '255.255.255.255'
-            
-            # Извлекаем BOOTP поля если есть
-            ciaddr = '0.0.0.0'
-            yiaddr = '0.0.0.0' 
-            siaddr = '0.0.0.0'
-            chaddr = ''
-            xid = '0'
-            
-            if hasattr(packet, 'bootp'):
-                bootp = packet.bootp
-                ciaddr = getattr(bootp, 'ciaddr', '0.0.0.0')
-                yiaddr = getattr(bootp, 'yiaddr', '0.0.0.0')
-                siaddr = getattr(bootp, 'siaddr', '0.0.0.0')
-                chaddr = getattr(bootp, 'chaddr', '')
-                xid = getattr(bootp, 'id', '0')
-            
-            event = {
-                'packet_number': num,
-                'timestamp': packet.sniff_time,
-                'source_ip': src_ip,
-                'dest_ip': dst_ip,
-                'source_mac': chaddr,
-                'client_ip': ciaddr,
-                'your_ip': yiaddr,
-                'server_ip': siaddr,
-                'message_type': msg_type,
-                'transaction_id': xid,
-                'lease_time': None
-            }
-            
-            # Пробуем получить время аренды
-            if hasattr(dhcp, 'dhcp_lease_time'):
-                event['lease_time'] = dhcp.dhcp_lease_time
-            
-            self.dhcp_events.append(event)
-            print(f"    [Пакет {num}] {msg_type} - {src_ip} -> {dst_ip}")
-            
-        except Exception as e:
-            print(f"[-] Ошибка обработки DHCP пакета {num}: {e}")
-    
-    def process_bootp_packet(self, packet, num):
-        """Обработка BOOTP пакета"""
-        try:
-            bootp = packet.bootp
-            
-            # Определяем тип сообщения по opcode
-            opcode = getattr(bootp, 'opcode', '1')
-            msg_type = 'BOOTP_REQUEST' if str(opcode) == '1' else 'BOOTP_REPLY'
-            
-            # Если есть DHCP опции, определяем тип
-            if hasattr(bootp, 'dhcp_message_type'):
-                type_map = {
-                    '1': 'DISCOVER',
-                    '2': 'OFFER',
-                    '3': 'REQUEST', 
-                    '4': 'DECLINE',
-                    '5': 'ACK',
-                    '6': 'NAK',
-                    '7': 'RELEASE',
-                    '8': 'INFORM'
-                }
-                msg_type = type_map.get(str(bootp.dhcp_message_type), msg_type)
-            
-            event = {
-                'packet_number': num,
-                'timestamp': packet.sniff_time,
-                'source_ip': packet.ip.src if hasattr(packet, 'ip') else '0.0.0.0',
-                'dest_ip': packet.ip.dst if hasattr(packet, 'ip') else '255.255.255.255',
-                'source_mac': getattr(bootp, 'chaddr', ''),
-                'client_ip': getattr(bootp, 'ciaddr', '0.0.0.0'),
-                'your_ip': getattr(bootp, 'yiaddr', '0.0.0.0'),
-                'server_ip': getattr(bootp, 'siaddr', '0.0.0.0'),
-                'message_type': msg_type,
-                'transaction_id': getattr(bootp, 'id', '0'),
-                'lease_time': None
-            }
-            
-            self.dhcp_events.append(event)
-            print(f"    [Пакет {num}] {msg_type} (BOOTP)")
-            
-        except Exception as e:
-            print(f"[-] Ошибка обработки BOOTP пакета {num}: {e}")
-    
-    def process_generic_packet(self, packet, num):
-        """Обработка пакета с DHCP информацией (общий случай)"""
-        try:
-            # Пробуем найти DHCP информацию в любом виде
-            event = {
-                'packet_number': num,
-                'timestamp': packet.sniff_time,
-                'source_ip': packet.ip.src if hasattr(packet, 'ip') else '0.0.0.0',
-                'dest_ip': packet.ip.dst if hasattr(packet, 'ip') else '255.255.255.255',
-                'source_mac': '',
-                'client_ip': '0.0.0.0',
-                'your_ip': '0.0.0.0',
-                'server_ip': '0.0.0.0',
-                'message_type': 'DHCP',
-                'transaction_id': '0',
-                'lease_time': None
-            }
-            
-            # Проверяем строковое представление пакета на наличие типа DHCP
-            packet_str = str(packet)
-            if 'Discover' in packet_str:
-                event['message_type'] = 'DISCOVER'
-            elif 'Offer' in packet_str:
-                event['message_type'] = 'OFFER'
-            elif 'Request' in packet_str:
-                event['message_type'] = 'REQUEST'
-            elif 'ACK' in packet_str:
-                event['message_type'] = 'ACK'
-            elif 'NAK' in packet_str:
-                event['message_type'] = 'NAK'
-            
-            self.dhcp_events.append(event)
-            print(f"    [Пакет {num}] {event['message_type']} (generic)")
-            
-        except Exception as e:
-            print(f"[-] Ошибка обработки generic пакета {num}: {e}")
-    
-    def extract_leases(self):
-        """Извлечение информации о DHCP арендах"""
-        print("\n[+] Анализ DHCP аренд (DORA процесс)...")
-        
-        # Группировка по transaction ID
-        transactions = defaultdict(list)
-        
-        for event in self.dhcp_events:
-            tid = event['transaction_id']
-            transactions[tid].append(event)
-        
-        # Анализируем каждый transaction
-        for tid, events in transactions.items():
-            discover = None
-            offer = None
-            request = None
-            ack = None
-            
-            for event in events:
-                msg_type = event['message_type']
-                if msg_type == 'DISCOVER':
-                    discover = event
-                elif msg_type == 'OFFER':
-                    offer = event
-                elif msg_type == 'REQUEST':
-                    request = event
-                elif msg_type == 'ACK':
-                    ack = event
-            
-            # Если есть полный DORA процесс
-            if discover and offer and request and ack:
-                try:
-                    total_time = (ack['timestamp'] - discover['timestamp']).total_seconds()
-                except:
-                    total_time = 0
-                
-                lease_info = {
-                    'transaction_id': tid,
-                    'mac_address': offer.get('source_mac', ''),
-                    'assigned_ip': ack.get('your_ip', ''),
-                    'server_ip': ack.get('server_ip', ''),
-                    'discover_time': discover['timestamp'],
-                    'offer_time': offer['timestamp'],
-                    'request_time': request['timestamp'],
-                    'ack_time': ack['timestamp'],
-                    'total_time_seconds': total_time
-                }
-                self.dhcp_leases.append(lease_info)
-                print(f"    [Transaction {tid}] Выдан IP: {ack.get('your_ip', 'N/A')}")
-        
-        print(f"[+] Найдено полных DORA процессов: {len(self.dhcp_leases)}")
-    
-    def save_artifacts(self, artifacts_dir='artifacts'):
-        """Сохранение артефактов"""
-        print(f"\n[+] Сохранение артефактов...")
-        
-        os.makedirs(artifacts_dir, exist_ok=True)
-        
-        if self.dhcp_events:
-            # Сохраняем события
-            df_events = pd.DataFrame(self.dhcp_events)
-            events_file = os.path.join(artifacts_dir, 'dhcp_events.csv')
-            df_events.to_csv(events_file, index=False, encoding='utf-8')
-            print(f"[+] Сохранено событий: {events_file} ({len(df_events)} записей)")
-        
-        if self.dhcp_leases:
-            # Сохраняем аренды
-            df_leases = pd.DataFrame(self.dhcp_leases)
-            leases_file = os.path.join(artifacts_dir, 'dhcp_leases.csv')
-            df_leases.to_csv(leases_file, index=False, encoding='utf-8')
-            print(f"[+] Сохранено аренд: {leases_file} ({len(df_leases)} записей)")
-    
-    def create_visualizations(self, outputs_dir='outputs'):
-        """Создание визуализаций"""
-        print(f"\n[+] Создание визуализаций...")
-        
-        os.makedirs(outputs_dir, exist_ok=True)
-        
-        if not self.dhcp_events:
-            print("[-] Нет данных для визуализации")
-            return
-        
-        df = pd.DataFrame(self.dhcp_events)
-        sns.set_style("whitegrid")
-        
-        # 1. График сообщений по времени
-        plt.figure(figsize=(12, 6))
-        try:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df['time_sec'] = (df['timestamp'] - df['timestamp'].min()).dt.total_seconds()
-            
-            for msg_type in df['message_type'].unique():
-                subset = df[df['message_type'] == msg_type]
-                plt.scatter(subset['time_sec'], [1]*len(subset), label=msg_type, s=100)
-            
-            plt.xlabel('Время (секунды от начала)')
-            plt.ylabel('События')
-            plt.title('DHCP сообщения во времени')
-            plt.legend()
-            plt.yticks([])
-            plt.grid(True, axis='x')
-            
-            output_file = os.path.join(outputs_dir, 'dhcp_messages_over_time.png')
-            plt.savefig(output_file, dpi=300, bbox_inches='tight')
-            plt.close()
-            print(f"[+] Сохранен график: {output_file}")
-        except Exception as e:
-            print(f"[-] Ошибка создания графика 1: {e}")
-            plt.close()
-        
-        # 2. Диаграмма типов сообщений
-        plt.figure(figsize=(8, 8))
-        msg_counts = df['message_type'].value_counts()
-        
-        if len(msg_counts) > 0:
-            colors = plt.cm.Set3(range(len(msg_counts)))
-            plt.pie(msg_counts.values, labels=msg_counts.index, autopct='%1.1f%%', 
-                   colors=colors, startangle=90)
-            plt.title('Распределение типов DHCP сообщений')
-            
-            output_file = os.path.join(outputs_dir, 'dhcp_message_types.png')
-            plt.savefig(output_file, dpi=300, bbox_inches='tight')
-            plt.close()
-            print(f"[+] Сохранен график: {output_file}")
-        else:
-            plt.close()
-    
-    def generate_report(self):
-        """Генерация отчета"""
-        print("\n" + "="*70)
-        print("ОТЧЕТ ПО АНАЛИЗУ DHCP ТРАФИКА")
-        print("="*70)
-        
-        print(f"\n1. ОБЩАЯ СТАТИСТИКА:")
-        print(f"   - Всего DHCP событий: {len(self.dhcp_events)}")
-        print(f"   - Полных DORA процессов: {len(self.dhcp_leases)}")
-        
-        if self.dhcp_events:
-            df = pd.DataFrame(self.dhcp_events)
-            
-            print(f"\n2. ТИПЫ СООБЩЕНИЙ:")
-            for msg_type, count in df['message_type'].value_counts().items():
-                print(f"   - {msg_type}: {count}")
-            
-            print(f"\n3. УЧАСТНИКИ:")
-            print(f"   - DHCP серверы: {df['server_ip'].unique()}")
-            print(f"   - Клиентов (по IP): {df['source_ip'].nunique()}")
-            
-            print(f"\n4. ВЫДАННЫЕ IP АДРЕСА:")
-            for lease in self.dhcp_leases:
-                print(f"   - {lease.get('assigned_ip', 'N/A')} (MAC: {lease.get('mac_address', 'N/A')})")
-        
-        print("\n" + "="*70)
-        print("ВЫВОДЫ:")
-        print("="*70)
-        
-        # Проверка на аномалии
-        if len(self.dhcp_leases) > 0:
-            print("✓ Обнаружен успешный DHCP handshake")
-            print("✓ Клиент получил IP адрес от сервера")
-        else:
-            print("! Не найдено полных DORA процессов")
-        
-        print("\n[+] Анализ завершен!")
+    if not PCAP_PATH.exists():
+        raise FileNotFoundError(f"Не найден файл дампа: {PCAP_PATH}")
 
+    # Фикс для Python 3.14 / asyncio: создаём event loop явно
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
-def main():
-    """Основная функция"""
-    pcap_file = 'data/dhcp.pcapng'
-    
-    if not os.path.exists(pcap_file):
-        print(f"[-] Ошибка: файл {pcap_file} не найден!")
-        print("    Убедитесь, что файл находится в папке data/")
-        return
-    
-    analyzer = DHCPAnalyzer(pcap_file)
-    
-    if analyzer.load_and_analyze():
-        analyzer.extract_leases()
-        analyzer.save_artifacts()
-        analyzer.create_visualizations()
-        analyzer.generate_report()
+    # Важно: display_filter = "bootp" обычно покрывает DHCP
+    cap = pyshark.FileCapture(
+        str(PCAP_PATH),
+        display_filter="bootp",
+        keep_packets=False,
+        use_json=True,
+        include_raw=False,
+    )
+
+    events: List[Dict[str, Any]] = []
+
+    # DHCP message type mapping
+    dhcp_type_map = {
+        "1": "Discover",
+        "2": "Offer",
+        "3": "Request",
+        "4": "Decline",
+        "5": "ACK",
+        "6": "NAK",
+        "7": "Release",
+        "8": "Inform",
+    }
+
+    for pkt in cap:
+        t_epoch = normalize_epoch(pkt)
+
+        ip_src = _safe(pkt, "ip.src")
+        ip_dst = _safe(pkt, "ip.dst")
+
+        xid = _safe(pkt, "bootp.xid")
+        client_mac = _safe(pkt, "bootp.hw_mac_addr") or _safe(pkt, "bootp.chaddr")
+
+        yiaddr = _safe(pkt, "bootp.yiaddr")
+        siaddr = _safe(pkt, "bootp.siaddr")
+
+        # msg type
+        dhcp_msg_type = _safe(pkt, "dhcp.option_dhcp") or _safe(pkt, "bootp.option_dhcp")
+        dhcp_msg_type_human = dhcp_type_map.get(str(dhcp_msg_type), str(dhcp_msg_type) if dhcp_msg_type is not None else None)
+
+        hostname = _safe(pkt, "dhcp.option_hostname")
+        requested_ip = _safe(pkt, "dhcp.option_requested_ip_address")
+        server_id = _safe(pkt, "dhcp.option_dhcp_server_id")
+        router = _safe(pkt, "dhcp.option_router")
+        dns = _safe(pkt, "dhcp.option_domain_name_server")
+
+        events.append(
+            {
+                "time_epoch": t_epoch,
+                "ip_src": ip_src,
+                "ip_dst": ip_dst,
+                "xid": xid,
+                "client_mac": client_mac,
+                "msg_type": dhcp_msg_type_human,
+                "yiaddr_assigned": yiaddr,
+                "server_ip": siaddr or server_id,
+                "requested_ip": requested_ip,
+                "hostname": hostname,
+                "router": router,
+                "dns": dns,
+            }
+        )
+
+    df = pd.DataFrame(events)
+
+    # Нормализуем время
+    df["time"] = pd.to_datetime(df["time_epoch"], unit="s", errors="coerce")
+
+    # DEBUG (можешь потом убрать)
+    print("DEBUG: rows total =", len(df))
+    if "time_epoch" in df.columns:
+        print("DEBUG: time_epoch non-null =", int(df["time_epoch"].notna().sum()))
+    if "time" in df.columns:
+        print("DEBUG: time non-null =", int(df["time"].notna().sum()))
+
+    # Сохраняем «лог артефактов»
+    if not df.empty and "time" in df.columns:
+        df.sort_values("time", inplace=True)
+    df.to_csv(ARTIFACTS_DIR / "dhcp_events.csv", index=False)
+
+    # -----------------------------
+    # Leases (ACK/OFFER)
+    # -----------------------------
+    if not df.empty and "msg_type" in df.columns:
+        leases = df[df["msg_type"].isin(["ACK", "Offer"])].copy()
     else:
-        print("[-] Не удалось проанализировать файл")
+        leases = df.copy()
+
+    if not leases.empty:
+        leases_summary = (
+            leases.dropna(subset=["client_mac", "yiaddr_assigned"])
+            .sort_values("time", na_position="last")
+            .groupby("client_mac", as_index=False)
+            .tail(1)
+            .loc[:, ["client_mac", "hostname", "yiaddr_assigned", "server_ip", "time"]]
+            .rename(columns={"yiaddr_assigned": "assigned_ip"})
+        )
+    else:
+        leases_summary = pd.DataFrame(columns=["client_mac", "hostname", "assigned_ip", "server_ip", "time"])
+
+    leases_summary.to_csv(ARTIFACTS_DIR / "dhcp_leases.csv", index=False)
+
+    # -----------------------------
+    # Визуализация 1: количество DHCP-сообщений по типам
+    # -----------------------------
+    if not df.empty and "msg_type" in df.columns:
+        type_counts = df["msg_type"].fillna("Unknown").value_counts()
+    else:
+        type_counts = pd.Series(dtype=int)
+
+    plt.figure()
+    if not type_counts.empty:
+        type_counts.plot(kind="bar")
+    plt.title("DHCP message types (counts)")
+    plt.xlabel("Message type")
+    plt.ylabel("Count")
+    plt.tight_layout()
+    plt.savefig(OUTPUTS_DIR / "dhcp_message_types.png", dpi=200)
+    plt.close()
+
+    # -----------------------------
+    # Визуализация 2: активность во времени
+    # -----------------------------
+    plt.figure()
+
+    if not df.empty and df["time"].notna().any():
+        df_time = df.dropna(subset=["time"]).copy()
+        df_time["minute"] = df_time["time"].dt.floor("min")
+        series = df_time.groupby("minute").size()
+        series.plot()
+        plt.title("DHCP messages over time (per minute)")
+        plt.xlabel("Time (minute)")
+        plt.ylabel("Messages")
+    else:
+        series = pd.Series(range(1, len(df) + 1), index=range(len(df)))
+        series.plot()
+        plt.title("DHCP messages over capture order")
+        plt.xlabel("Packet index")
+        plt.ylabel("Cumulative messages")
+
+    plt.tight_layout()
+    plt.savefig(OUTPUTS_DIR / "dhcp_message_over_time.png", dpi=200)
+    plt.close()
+
+    print("OK: artifacts saved to:", ARTIFACTS_DIR)
+    print("OK: plots saved to:", OUTPUTS_DIR)
 
 
 if __name__ == "__main__":
