@@ -1,97 +1,108 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
-from typing import Any, Optional, Dict, List
-
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
-# -----------------------------
-# Настройки путей
-# -----------------------------
 BASE_DIR = Path(__file__).resolve().parents[1]
 PCAP_PATH = BASE_DIR / "data" / "dhcp.pcapng"
+
 ARTIFACTS_DIR = BASE_DIR / "artifacts"
 OUTPUTS_DIR = BASE_DIR / "outputs"
-
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# -----------------------------
-# Утилиты для безопасного извлечения полей pyshark
-# -----------------------------
-def _safe_get(pkt: Any, layer_name: str, field: str) -> Optional[str]:
-    """Пробует достать поле из указанного слоя. Возвращает строку или None."""
-    try:
-        layer = getattr(pkt, layer_name)
-        if hasattr(layer, field):
-            return str(getattr(layer, field))
-        if hasattr(layer, "get_field_value"):
-            v = layer.get_field_value(field)
-            return str(v) if v is not None else None
-        return None
-    except Exception:
-        return None
+def require_tshark() -> str:
+    tshark = shutil.which("tshark")
+    if not tshark:
+        raise RuntimeError(
+            "tshark не найден. Установи Wireshark (с TShark) и добавь его в PATH.\n"
+            "Проверка: tshark -v"
+        )
+    return tshark
 
 
-def _safe(pkt: Any, expr: str) -> Optional[str]:
-    """expr вида: 'ip.src' или 'bootp.yiaddr'"""
-    try:
-        layer_name, field = expr.split(".", 1)
-        return _safe_get(pkt, layer_name, field)
-    except Exception:
-        return None
+def run_tshark_to_dataframe(cmd: list[str]) -> pd.DataFrame:
+    """
+    Запускает tshark, берёт TSV-вывод и превращает в DataFrame.
+    """
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if proc.returncode != 0:
+        raise RuntimeError(f"tshark завершился с ошибкой:\n{proc.stderr}")
+
+    text = proc.stdout.strip()
+    if not text:
+        return pd.DataFrame()
+
+    # tshark -T fields с -E header=y выдаёт TSV с заголовком
+    from io import StringIO
+    return pd.read_csv(StringIO(text), sep="\t")
 
 
-def normalize_epoch(pkt: Any) -> Optional[float]:
-    """Достаём время пакета в epoch (секунды)."""
-    # Основной вариант
-    try:
-        v = getattr(pkt, "sniff_timestamp", None)
-        if v is not None:
-            return float(v)
-    except Exception:
-        pass
+def extract_dns(tshark: str) -> pd.DataFrame:
+    # DNS QUERIES (response == 0)
+    cmd = [
+        tshark, "-r", str(PCAP_PATH),
+        "-Y", "dns && dns.flags.response==0",
+        "-T", "fields",
+        "-E", "header=y",
+        "-E", "separator=\t",
+        "-e", "frame.time_epoch",
+        "-e", "ip.src",
+        "-e", "ip.dst",
+        "-e", "dns.qry.name",
+    ]
+    df = run_tshark_to_dataframe(cmd)
+    if df.empty:
+        return df
 
-    # Фолбэк: sniff_time -> datetime
-    try:
-        st = getattr(pkt, "sniff_time", None)
-        if st is not None:
-            return float(st.timestamp())
-    except Exception:
-        pass
+    df.rename(columns={
+        "frame.time_epoch": "time_epoch",
+        "ip.src": "src_ip",
+        "ip.dst": "dst_ip",
+        "dns.qry.name": "domain",
+    }, inplace=True)
 
-    return None
+    df["time_epoch"] = pd.to_numeric(df["time_epoch"], errors="coerce")
+    df["time"] = pd.to_datetime(df["time_epoch"], unit="s", errors="coerce")
+    return df
 
 
-# -----------------------------
-# Основной парсинг
-# -----------------------------
-def main() -> None:
-    # Импорт здесь, чтобы файл открывался даже без pyshark
-    import pyshark  # type: ignore
-    import asyncio
+def extract_dhcp(tshark: str) -> pd.DataFrame:
+    # DHCP/BOOTP events
+    cmd = [
+        tshark, "-r", str(PCAP_PATH),
+        "-Y", "bootp",
+        "-T", "fields",
+        "-E", "header=y",
+        "-E", "separator=\t",
+        "-e", "frame.time_epoch",
+        "-e", "ip.src",
+        "-e", "ip.dst",
+        "-e", "eth.src",
+        "-e", "bootp.option.dhcp",   # тип DHCP сообщения (часто цифра)
+        "-e", "bootp.yiaddr",        # assigned ip
+        "-e", "bootp.xid",
+    ]
+    df = run_tshark_to_dataframe(cmd)
+    if df.empty:
+        return df
 
-    if not PCAP_PATH.exists():
-        raise FileNotFoundError(f"Не найден файл дампа: {PCAP_PATH}")
+    df.rename(columns={
+        "frame.time_epoch": "time_epoch",
+        "ip.src": "src_ip",
+        "ip.dst": "dst_ip",
+        "eth.src": "client_mac",
+        "bootp.option.dhcp": "dhcp_type_raw",
+        "bootp.yiaddr": "assigned_ip",
+        "bootp.xid": "xid",
+    }, inplace=True)
 
-    # Фикс для Python 3.14 / asyncio: создаём event loop явно
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
-    # Важно: display_filter = "bootp" обычно покрывает DHCP
-    cap = pyshark.FileCapture(
-        str(PCAP_PATH),
-        display_filter="bootp",
-        keep_packets=False,
-        use_json=True,
-        include_raw=False,
-    )
-
-    events: List[Dict[str, Any]] = []
-
-    # DHCP message type mapping
+    # Карта типов DHCP (если приходит числом)
     dhcp_type_map = {
         "1": "Discover",
         "2": "Offer",
@@ -102,131 +113,87 @@ def main() -> None:
         "7": "Release",
         "8": "Inform",
     }
+    df["dhcp_type_raw"] = df["dhcp_type_raw"].astype(str).str.strip()
+    df["dhcp_type"] = df["dhcp_type_raw"].map(dhcp_type_map).fillna(df["dhcp_type_raw"])
 
-    for pkt in cap:
-        t_epoch = normalize_epoch(pkt)
-
-        ip_src = _safe(pkt, "ip.src")
-        ip_dst = _safe(pkt, "ip.dst")
-
-        xid = _safe(pkt, "bootp.xid")
-        client_mac = _safe(pkt, "bootp.hw_mac_addr") or _safe(pkt, "bootp.chaddr")
-
-        yiaddr = _safe(pkt, "bootp.yiaddr")
-        siaddr = _safe(pkt, "bootp.siaddr")
-
-        # msg type
-        dhcp_msg_type = _safe(pkt, "dhcp.option_dhcp") or _safe(pkt, "bootp.option_dhcp")
-        dhcp_msg_type_human = dhcp_type_map.get(str(dhcp_msg_type), str(dhcp_msg_type) if dhcp_msg_type is not None else None)
-
-        hostname = _safe(pkt, "dhcp.option_hostname")
-        requested_ip = _safe(pkt, "dhcp.option_requested_ip_address")
-        server_id = _safe(pkt, "dhcp.option_dhcp_server_id")
-        router = _safe(pkt, "dhcp.option_router")
-        dns = _safe(pkt, "dhcp.option_domain_name_server")
-
-        events.append(
-            {
-                "time_epoch": t_epoch,
-                "ip_src": ip_src,
-                "ip_dst": ip_dst,
-                "xid": xid,
-                "client_mac": client_mac,
-                "msg_type": dhcp_msg_type_human,
-                "yiaddr_assigned": yiaddr,
-                "server_ip": siaddr or server_id,
-                "requested_ip": requested_ip,
-                "hostname": hostname,
-                "router": router,
-                "dns": dns,
-            }
-        )
-
-    df = pd.DataFrame(events)
-
-    # Нормализуем время
+    df["time_epoch"] = pd.to_numeric(df["time_epoch"], errors="coerce")
     df["time"] = pd.to_datetime(df["time_epoch"], unit="s", errors="coerce")
+    return df
 
-    # DEBUG (можешь потом убрать)
-    print("DEBUG: rows total =", len(df))
-    if "time_epoch" in df.columns:
-        print("DEBUG: time_epoch non-null =", int(df["time_epoch"].notna().sum()))
-    if "time" in df.columns:
-        print("DEBUG: time non-null =", int(df["time"].notna().sum()))
 
-    # Сохраняем «лог артефактов»
-    if not df.empty and "time" in df.columns:
-        df.sort_values("time", inplace=True)
-    df.to_csv(ARTIFACTS_DIR / "dhcp_events.csv", index=False)
+def plot_dns(df_dns: pd.DataFrame) -> None:
+    # 1) DNS по времени (по минутам)
+    df = df_dns.dropna(subset=["time"]).copy()
+    if df.empty:
+        return
 
-    # -----------------------------
-    # Leases (ACK/OFFER)
-    # -----------------------------
-    if not df.empty and "msg_type" in df.columns:
-        leases = df[df["msg_type"].isin(["ACK", "Offer"])].copy()
-    else:
-        leases = df.copy()
-
-    if not leases.empty:
-        leases_summary = (
-            leases.dropna(subset=["client_mac", "yiaddr_assigned"])
-            .sort_values("time", na_position="last")
-            .groupby("client_mac", as_index=False)
-            .tail(1)
-            .loc[:, ["client_mac", "hostname", "yiaddr_assigned", "server_ip", "time"]]
-            .rename(columns={"yiaddr_assigned": "assigned_ip"})
-        )
-    else:
-        leases_summary = pd.DataFrame(columns=["client_mac", "hostname", "assigned_ip", "server_ip", "time"])
-
-    leases_summary.to_csv(ARTIFACTS_DIR / "dhcp_leases.csv", index=False)
-
-    # -----------------------------
-    # Визуализация 1: количество DHCP-сообщений по типам
-    # -----------------------------
-    if not df.empty and "msg_type" in df.columns:
-        type_counts = df["msg_type"].fillna("Unknown").value_counts()
-    else:
-        type_counts = pd.Series(dtype=int)
+    df["minute"] = df["time"].dt.floor("min")
+    series = df.groupby("minute").size()
 
     plt.figure()
-    if not type_counts.empty:
-        type_counts.plot(kind="bar")
-    plt.title("DHCP message types (counts)")
-    plt.xlabel("Message type")
+    series.plot()
+    plt.xlabel("Time (minute)")
+    plt.ylabel("DNS queries")
+    plt.title("DNS queries over time")
+    plt.tight_layout()
+    plt.savefig(OUTPUTS_DIR / "dns_requests_over_time.png", dpi=200)
+    plt.close()
+
+    # 2) Топ доменов
+    top = df["domain"].dropna().astype(str).value_counts().head(10)
+    if not top.empty:
+        plt.figure()
+        top.plot(kind="bar")
+        plt.xlabel("Domain")
+        plt.ylabel("Count")
+        plt.title("Top-10 DNS domains")
+        plt.tight_layout()
+        plt.savefig(OUTPUTS_DIR / "top_domains.png", dpi=200)
+        plt.close()
+
+
+def plot_dhcp(df_dhcp: pd.DataFrame) -> None:
+    df = df_dhcp.copy()
+    if df.empty:
+        return
+    counts = df["dhcp_type"].fillna("Unknown").value_counts()
+
+    plt.figure()
+    counts.plot(kind="bar")
+    plt.xlabel("DHCP message type")
     plt.ylabel("Count")
+    plt.title("DHCP message types (counts)")
     plt.tight_layout()
     plt.savefig(OUTPUTS_DIR / "dhcp_message_types.png", dpi=200)
     plt.close()
 
-    # -----------------------------
-    # Визуализация 2: активность во времени
-    #   - если время есть → по минутам
-    #   - если времени нет → по порядку пакетов (fallback)
-    # -----------------------------
-    plt.figure()
 
-    if not df.empty and df["time"].notna().any():
-        df_time = df.dropna(subset=["time"]).copy()
-        df_time["minute"] = df_time["time"].dt.floor("min")
-        series = df_time.groupby("minute").size()
-        series.plot()
-        plt.title("DHCP messages over time (per minute)")
-        plt.xlabel("Time (minute)")
-        plt.ylabel("Messages")
-    else:
-        series = pd.Series(range(1, len(df) + 1), index=range(len(df)))
-        series.plot()
-        plt.title("DHCP messages over capture order")
-        plt.xlabel("Packet index")
-        plt.ylabel("Cumulative messages")
+def main() -> None:
+    if not PCAP_PATH.exists():
+        raise FileNotFoundError(f"Не найден файл дампа: {PCAP_PATH}")
 
-    plt.tight_layout()
-    plt.savefig(OUTPUTS_DIR / "dhcp_message_over_time.png", dpi=200)
-    plt.close()
+    tshark = require_tshark()
 
-    print("OK: artifacts saved to:", ARTIFACTS_DIR)
-    print("OK: plots saved to:", OUTPUTS_DIR)
+    # --- DNS (как в ноутбуке) ---
+    df_dns = extract_dns(tshark)
+    (ARTIFACTS_DIR / "dns_requests.csv").write_text("", encoding="utf-8")  # чтобы файл был даже если пусто
+    if not df_dns.empty:
+        df_dns.to_csv(ARTIFACTS_DIR / "dns_requests.csv", index=False)
+
+    # --- DHCP (значимые события из твоего дампа) ---
+    df_dhcp = extract_dhcp(tshark)
+    (ARTIFACTS_DIR / "dhcp_events.csv").write_text("", encoding="utf-8")
+    if not df_dhcp.empty:
+        df_dhcp.to_csv(ARTIFACTS_DIR / "dhcp_events.csv", index=False)
+
+    # --- Визуализации ---
+    plot_dns(df_dns)
+    plot_dhcp(df_dhcp)
+
+    print("OK. Saved:")
+    print("  artifacts/dns_requests.csv  (rows:", len(df_dns), ")")
+    print("  artifacts/dhcp_events.csv   (rows:", len(df_dhcp), ")")
+    print("  outputs/*.png")
 
 
 if __name__ == "__main__":
